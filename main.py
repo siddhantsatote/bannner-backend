@@ -5,6 +5,8 @@ import binascii
 import json
 import os
 import re
+import urllib.error
+import urllib.request
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -182,18 +184,47 @@ def _hf_detect_object(image_data: str, object_prompt: str) -> tuple[RefBox, str 
             detail="HF_API_TOKEN is not configured. Add it in Railway to enable AI object detection.",
         )
 
-    image_bytes = _decode_image_bytes(image_data)
-
     prompt = _normalize_object_prompt(object_prompt)
+    image_bytes = _decode_image_bytes(image_data)
+    encoded_image = base64.b64encode(image_bytes).decode("utf-8")
+
+    url = f"https://api-inference.huggingface.co/models/{HF_OBJECT_MODEL}"
+    request_body = json.dumps(
+        {
+            "inputs": encoded_image,
+            "parameters": {
+                "candidate_labels": [prompt],
+                "threshold": 0.1,
+            },
+        }
+    ).encode("utf-8")
+
+    request = urllib.request.Request(
+        url,
+        data=request_body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {HF_API_TOKEN}",
+            "Content-Type": "application/json",
+        },
+    )
 
     try:
-        detections = _get_hf_client().zero_shot_object_detection(
-            image_bytes,
-            candidate_labels=[prompt],
-            model=HF_OBJECT_MODEL,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Hugging Face detection failed: {exc}") from exc
+        with urllib.request.urlopen(request, timeout=90) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="ignore")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Hugging Face detection failed: {body or exc.reason}",
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise HTTPException(status_code=502, detail=f"Hugging Face detection unreachable: {exc.reason}") from exc
+
+    if isinstance(payload, dict) and payload.get("error"):
+        raise HTTPException(status_code=502, detail=f"Hugging Face error: {payload['error']}")
+
+    detections = payload if isinstance(payload, list) else []
 
     if not detections:
         raise HTTPException(status_code=404, detail="No object detected in the image")
