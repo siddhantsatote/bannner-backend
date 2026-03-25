@@ -53,7 +53,7 @@ PHONE_DIMENSIONS: dict[str, PhoneDimensions] = {
     "oneplus_nord_ce_5": PhoneDimensions(width_cm=7.602, height_cm=16.358),
 }
 
-HF_OBJECT_MODEL = os.getenv("HF_OBJECT_MODEL", "google/owlvit-base-patch32")
+HF_OBJECT_MODEL = os.getenv("HF_OBJECT_MODEL", "google/owlv2-base-patch16-ensemble")
 HF_API_TOKEN = os.getenv("HF_API_TOKEN", "")
 HF_LLM_MODEL = os.getenv("HF_LLM_MODEL", "").strip()
 HF_API_BASE_URL = os.getenv("HF_API_BASE_URL", "https://router.huggingface.co").rstrip("/")
@@ -196,13 +196,18 @@ def _hf_detect_object(image_data: str, object_prompt: str) -> tuple[RefBox, str 
     else:
         image_input = f"data:image/jpeg;base64,{encoded_image}"
 
-    url = f"{HF_API_BASE_URL}/models/{HF_OBJECT_MODEL}"
+    # Use HF inference pipeline endpoint for zero-shot object detection.
+    # https://huggingface.co/docs/api-inference/using_the_api/pipelines
+    url = f"{HF_API_BASE_URL}/pipeline/zero-shot-object-detection"
     request_body = json.dumps(
         {
+            "model": HF_OBJECT_MODEL,
             "inputs": image_input,
             "parameters": {
                 "candidate_labels": [prompt],
                 "threshold": 0.1,
+            },
+            "options": {
                 "wait_for_model": True,
             },
         }
