@@ -104,6 +104,16 @@ def _cm_per_pixel_from_phone(phone_box: RefBox, phone_dimensions: PhoneDimension
     return (cm_per_px_width + cm_per_px_height) / 2.0
 
 
+def _phone_scales(phone_box: RefBox, phone_dimensions: PhoneDimensions) -> tuple[float, float]:
+    if phone_box.w <= 0 or phone_box.h <= 0:
+        raise HTTPException(status_code=400, detail="phone_box width and height must be greater than zero")
+
+    return (
+        phone_dimensions.width_cm / phone_box.w,
+        phone_dimensions.height_cm / phone_box.h,
+    )
+
+
 def _measure_box_cm(box: RefBox, cm_per_pixel: float) -> tuple[float, float]:
     return round(box.w * cm_per_pixel, 2), round(box.h * cm_per_pixel, 2)
 
@@ -119,8 +129,9 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
 
     if payload.phone_box and payload.object_box:
         phone_dimensions = _get_phone_dimensions(payload.phone_model)
-        cm_per_pixel = _cm_per_pixel_from_phone(payload.phone_box, phone_dimensions)
-        width_cm, height_cm = _measure_box_cm(payload.object_box, cm_per_pixel)
+        cm_per_pixel_x, cm_per_pixel_y = _phone_scales(payload.phone_box, phone_dimensions)
+        width_cm = round(payload.object_box.w * cm_per_pixel_x, 2)
+        height_cm = round(payload.object_box.h * cm_per_pixel_y, 2)
         aspect_ratio = round(width_cm / max(height_cm, 1e-6), 2)
 
         contour: list[list[float]] = [
@@ -135,7 +146,7 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
             height_cm=height_cm,
             aspect_ratio=aspect_ratio,
             mask_contour=contour,
-            cm_per_pixel=round(cm_per_pixel, 6),
+            cm_per_pixel=round((cm_per_pixel_x + cm_per_pixel_y) / 2.0, 6),
         )
 
     if payload.ref_box and payload.ref_size_cm:
