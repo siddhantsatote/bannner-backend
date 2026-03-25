@@ -53,7 +53,7 @@ PHONE_DIMENSIONS: dict[str, PhoneDimensions] = {
     "oneplus_nord_ce_5": PhoneDimensions(width_cm=7.602, height_cm=16.358),
 }
 
-HF_OBJECT_MODEL = os.getenv("HF_OBJECT_MODEL", "google/owlv2-base-patch16-ensemble")
+HF_OBJECT_MODEL = os.getenv("HF_OBJECT_MODEL", "google/owlvit-base-patch32")
 HF_API_TOKEN = os.getenv("HF_API_TOKEN", "")
 HF_LLM_MODEL = os.getenv("HF_LLM_MODEL", "").strip()
 HF_API_BASE_URL = os.getenv("HF_API_BASE_URL", "https://router.huggingface.co").rstrip("/")
@@ -189,10 +189,17 @@ def _hf_detect_object(image_data: str, object_prompt: str) -> tuple[RefBox, str 
     image_bytes = _decode_image_bytes(image_data)
     encoded_image = base64.b64encode(image_bytes).decode("utf-8")
 
+    # Keep original MIME if included (typically data:image/jpeg/png;base64,...)
+    if "," in image_data and image_data.startswith("data:"):
+        mime_prefix = image_data.split(",", 1)[0]
+        image_input = f"{mime_prefix},{encoded_image}"
+    else:
+        image_input = f"data:image/jpeg;base64,{encoded_image}"
+
     url = f"{HF_API_BASE_URL}/models/{HF_OBJECT_MODEL}"
     request_body = json.dumps(
         {
-            "inputs": encoded_image,
+            "inputs": image_input,
             "parameters": {
                 "candidate_labels": [prompt],
                 "threshold": 0.1,
@@ -216,9 +223,18 @@ def _hf_detect_object(image_data: str, object_prompt: str) -> tuple[RefBox, str 
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="ignore")
+        normalized = body.strip() or exc.reason
+        if exc.code in (404, 422):
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"Hugging Face detection failed: {normalized}. "
+                    "Check HF_OBJECT_MODEL + HF_API_BASE_URL (defaults to router.huggingface.co)."
+                ),
+            ) from exc
         raise HTTPException(
             status_code=502,
-            detail=f"Hugging Face detection failed: {body or exc.reason}",
+            detail=f"Hugging Face detection failed: {normalized}",
         ) from exc
     except urllib.error.URLError as exc:
         raise HTTPException(status_code=502, detail=f"Hugging Face detection unreachable: {exc.reason}") from exc
