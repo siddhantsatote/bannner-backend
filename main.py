@@ -56,6 +56,7 @@ PHONE_DIMENSIONS: dict[str, PhoneDimensions] = {
 HF_OBJECT_MODEL = os.getenv("HF_OBJECT_MODEL", "google/owlv2-base-patch16-ensemble")
 HF_API_TOKEN = os.getenv("HF_API_TOKEN", "")
 HF_LLM_MODEL = os.getenv("HF_LLM_MODEL", "").strip()
+HF_API_BASE_URL = os.getenv("HF_API_BASE_URL", "https://router.huggingface.co").rstrip("/")
 
 _hf_client: InferenceClient | None = None
 
@@ -188,13 +189,14 @@ def _hf_detect_object(image_data: str, object_prompt: str) -> tuple[RefBox, str 
     image_bytes = _decode_image_bytes(image_data)
     encoded_image = base64.b64encode(image_bytes).decode("utf-8")
 
-    url = f"https://api-inference.huggingface.co/models/{HF_OBJECT_MODEL}"
+    url = f"{HF_API_BASE_URL}/models/{HF_OBJECT_MODEL}"
     request_body = json.dumps(
         {
             "inputs": encoded_image,
             "parameters": {
                 "candidate_labels": [prompt],
                 "threshold": 0.1,
+                "wait_for_model": True,
             },
         }
     ).encode("utf-8")
@@ -229,18 +231,34 @@ def _hf_detect_object(image_data: str, object_prompt: str) -> tuple[RefBox, str 
     if not detections:
         raise HTTPException(status_code=404, detail="No object detected in the image")
 
-    ranked = sorted(detections, key=lambda det: float(getattr(det, "score", 0.0) or 0.0), reverse=True)
-    best = ranked[0]
-    box = getattr(best, "box", None)
-    xmin = float(getattr(box, "xmin", 0.0) or 0.0)
-    ymin = float(getattr(box, "ymin", 0.0) or 0.0)
-    xmax = float(getattr(box, "xmax", 0.0) or 0.0)
-    ymax = float(getattr(box, "ymax", 0.0) or 0.0)
+    def score_of(item: Any) -> float:
+        if isinstance(item, dict):
+            return float(item.get("score", 0.0) or 0.0)
+        return float(getattr(item, "score", 0.0) or 0.0)
+
+    best = max(detections, key=score_of)
+
+    if isinstance(best, dict):
+        box = best.get("box", {}) or {}
+        xmin = float(box.get("xmin", box.get("x", 0.0)) or 0.0)
+        ymin = float(box.get("ymin", box.get("y", 0.0)) or 0.0)
+        xmax = float(box.get("xmax", box.get("width", xmin)) or xmin)
+        ymax = float(box.get("ymax", box.get("height", ymin)) or ymin)
+        label = best.get("label")
+        score = float(best.get("score", 0.0) or 0.0)
+    else:
+        box = getattr(best, "box", None)
+        xmin = float(getattr(box, "xmin", 0.0) or 0.0)
+        ymin = float(getattr(box, "ymin", 0.0) or 0.0)
+        xmax = float(getattr(box, "xmax", 0.0) or 0.0)
+        ymax = float(getattr(box, "ymax", 0.0) or 0.0)
+        label = getattr(best, "label", None)
+        score = float(getattr(best, "score", 0.0) or 0.0)
 
     return (
         RefBox(x=xmin, y=ymin, w=max(xmax - xmin, 1.0), h=max(ymax - ymin, 1.0)),
-        str(getattr(best, "label", None)) if getattr(best, "label", None) is not None else None,
-        float(getattr(best, "score", 0.0) or 0.0),
+        str(label) if label is not None else None,
+        score,
     )
 
 
