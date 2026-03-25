@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import os
+import urllib.error
+import urllib.request
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -37,6 +40,8 @@ class AnalyzeResponse(BaseModel):
     aspect_ratio: float
     mask_contour: list[list[float]]
     cm_per_pixel: float | None = None
+    detected_label: str | None = None
+    detected_score: float | None = None
 
 
 PHONE_DIMENSIONS: dict[str, PhoneDimensions] = {
@@ -44,6 +49,9 @@ PHONE_DIMENSIONS: dict[str, PhoneDimensions] = {
     # Keeping it configurable avoids hard-coding a potentially wrong model size.
     "oneplus_nord_ce_5": PhoneDimensions(width_cm=7.602, height_cm=16.358),
 }
+
+HF_OBJECT_MODEL = os.getenv("HF_OBJECT_MODEL", "facebook/detr-resnet-50")
+HF_API_TOKEN = os.getenv("HF_API_TOKEN", "")
 
 
 app = FastAPI(title="Banner Buddy API", version="1.0.0")
@@ -75,6 +83,14 @@ def _validate_image_data(image_data: str) -> None:
         base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise HTTPException(status_code=400, detail="Invalid image_data payload") from exc
+
+
+def _decode_image_bytes(image_data: str) -> bytes:
+    if "," in image_data:
+        _, encoded = image_data.split(",", 1)
+    else:
+        encoded = image_data
+    return base64.b64decode(encoded)
 
 
 def _get_phone_dimensions(phone_model: str) -> PhoneDimensions:
@@ -118,6 +134,64 @@ def _measure_box_cm(box: RefBox, cm_per_pixel: float) -> tuple[float, float]:
     return round(box.w * cm_per_pixel, 2), round(box.h * cm_per_pixel, 2)
 
 
+def _hf_detect_object(image_data: str) -> tuple[RefBox, str | None, float | None]:
+    if not HF_API_TOKEN:
+        raise HTTPException(
+            status_code=500,
+            detail="HF_API_TOKEN is not configured. Add it in Railway to enable AI object detection.",
+        )
+
+    image_bytes = _decode_image_bytes(image_data)
+    url = f"https://api-inference.huggingface.co/models/{HF_OBJECT_MODEL}"
+    request = urllib.request.Request(
+        url,
+        data=image_bytes,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {HF_API_TOKEN}",
+            "Content-Type": "application/octet-stream",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        message = exc.read().decode("utf-8", errors="ignore")
+        raise HTTPException(status_code=502, detail=f"Hugging Face detection failed: {message or exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        raise HTTPException(status_code=502, detail=f"Hugging Face detection unreachable: {exc.reason}") from exc
+
+    if isinstance(payload, dict) and payload.get("error"):
+        raise HTTPException(status_code=502, detail=f"Hugging Face error: {payload['error']}")
+
+    detections = payload if isinstance(payload, list) else []
+    if not detections:
+        raise HTTPException(status_code=404, detail="No object detected in the image")
+
+    def _score(det: dict[str, Any]) -> float:
+        return float(det.get("score") or 0.0)
+
+    filtered = [
+        det
+        for det in detections
+        if "phone" not in str(det.get("label", "")).lower()
+    ]
+    ranked = sorted(filtered or detections, key=_score, reverse=True)
+    best = ranked[0]
+    box = best.get("box") or {}
+    xmin = float(box.get("xmin", 0.0))
+    ymin = float(box.get("ymin", 0.0))
+    xmax = float(box.get("xmax", 0.0))
+    ymax = float(box.get("ymax", 0.0))
+
+    return (
+        RefBox(x=xmin, y=ymin, w=max(xmax - xmin, 1.0), h=max(ymax - ymin, 1.0)),
+        str(best.get("label")) if best.get("label") is not None else None,
+        _score(best),
+    )
+
+
 @app.post("/api/analyze", response_model=AnalyzeResponse)
 def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
     _validate_image_data(payload.image_data)
@@ -147,6 +221,31 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
             aspect_ratio=aspect_ratio,
             mask_contour=contour,
             cm_per_pixel=round((cm_per_pixel_x + cm_per_pixel_y) / 2.0, 6),
+        )
+
+    if payload.phone_box and not payload.object_box:
+        phone_dimensions = _get_phone_dimensions(payload.phone_model)
+        cm_per_pixel_x, cm_per_pixel_y = _phone_scales(payload.phone_box, phone_dimensions)
+        detected_box, detected_label, detected_score = _hf_detect_object(payload.image_data)
+        width_cm = round(detected_box.w * cm_per_pixel_x, 2)
+        height_cm = round(detected_box.h * cm_per_pixel_y, 2)
+        aspect_ratio = round(width_cm / max(height_cm, 1e-6), 2)
+
+        contour: list[list[float]] = [
+            [detected_box.x, detected_box.y],
+            [detected_box.x + detected_box.w, detected_box.y],
+            [detected_box.x + detected_box.w, detected_box.y + detected_box.h],
+            [detected_box.x, detected_box.y + detected_box.h],
+        ]
+
+        return AnalyzeResponse(
+            width_cm=width_cm,
+            height_cm=height_cm,
+            aspect_ratio=aspect_ratio,
+            mask_contour=contour,
+            cm_per_pixel=round((cm_per_pixel_x + cm_per_pixel_y) / 2.0, 6),
+            detected_label=detected_label,
+            detected_score=detected_score,
         )
 
     if payload.ref_box and payload.ref_size_cm:
