@@ -27,7 +27,7 @@ class AnalyzeRequest(BaseModel):
     phone_box: RefBox | None = None
     object_box: RefBox | None = None
     phone_model: str = "oneplus_nord_ce_5"
-    ref_box: RefBox | None = None
+    ref_box: RefBox | None = Field(default=None, description="Manual phone reference box when YOLO is skipped")
     ref_size_cm: float | None = Field(default=None, gt=0)
 
 
@@ -111,6 +111,11 @@ def _measure_box_cm(box: RefBox, cm_per_pixel: float) -> tuple[float, float]:
 @app.post("/api/analyze", response_model=AnalyzeResponse)
 def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
     _validate_image_data(payload.image_data)
+
+    # Manual phone reference mode: if the frontend only sends ref_box + ref_size_cm,
+    # treat that box as the phone box and use the known phone width for scaling.
+    if payload.ref_box and payload.ref_size_cm and not payload.phone_box:
+        payload.phone_box = payload.ref_box
 
     if payload.phone_box and payload.object_box:
         phone_dimensions = _get_phone_dimensions(payload.phone_model)
