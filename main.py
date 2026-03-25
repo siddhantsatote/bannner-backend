@@ -4,12 +4,12 @@ import base64
 import binascii
 import json
 import os
-import urllib.error
-import urllib.request
+import re
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from huggingface_hub import InferenceClient
 from pydantic import BaseModel, Field
 
 
@@ -32,6 +32,7 @@ class AnalyzeRequest(BaseModel):
     phone_model: str = "oneplus_nord_ce_5"
     ref_box: RefBox | None = Field(default=None, description="Manual phone reference box when YOLO is skipped")
     ref_size_cm: float | None = Field(default=None, gt=0)
+    object_prompt: str | None = Field(default=None, description="Text prompt describing the object to detect")
 
 
 class AnalyzeResponse(BaseModel):
@@ -50,8 +51,11 @@ PHONE_DIMENSIONS: dict[str, PhoneDimensions] = {
     "oneplus_nord_ce_5": PhoneDimensions(width_cm=7.602, height_cm=16.358),
 }
 
-HF_OBJECT_MODEL = os.getenv("HF_OBJECT_MODEL", "facebook/detr-resnet-50")
+HF_OBJECT_MODEL = os.getenv("HF_OBJECT_MODEL", "google/owlv2-base-patch16-ensemble")
 HF_API_TOKEN = os.getenv("HF_API_TOKEN", "")
+HF_LLM_MODEL = os.getenv("HF_LLM_MODEL", "").strip()
+
+_hf_client: InferenceClient | None = None
 
 
 app = FastAPI(title="Banner Buddy API", version="1.0.0")
@@ -91,6 +95,13 @@ def _decode_image_bytes(image_data: str) -> bytes:
     else:
         encoded = image_data
     return base64.b64decode(encoded)
+
+
+def _get_hf_client() -> InferenceClient:
+    global _hf_client
+    if _hf_client is None:
+        _hf_client = InferenceClient(token=HF_API_TOKEN or None)
+    return _hf_client
 
 
 def _get_phone_dimensions(phone_model: str) -> PhoneDimensions:
@@ -134,7 +145,37 @@ def _measure_box_cm(box: RefBox, cm_per_pixel: float) -> tuple[float, float]:
     return round(box.w * cm_per_pixel, 2), round(box.h * cm_per_pixel, 2)
 
 
-def _hf_detect_object(image_data: str) -> tuple[RefBox, str | None, float | None]:
+def _normalize_object_prompt(prompt: str) -> str:
+    cleaned = re.sub(r"\s+", " ", prompt).strip().strip('"\'`.,:;!?')
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="object_prompt must not be empty")
+
+    if not HF_LLM_MODEL:
+        return cleaned
+
+    try:
+        response = _get_hf_client().text_generation(
+            prompt=(
+                "Rewrite the object description below as a short, concrete noun phrase for image detection. "
+                "Return only the phrase, no punctuation, no explanation.\n\n"
+                f"Object description: {cleaned}"
+            ),
+            model=HF_LLM_MODEL,
+            max_new_tokens=24,
+            temperature=0.1,
+            return_full_text=False,
+        )
+    except Exception:
+        return cleaned
+
+    if isinstance(response, str):
+        normalized = re.sub(r"\s+", " ", response).strip().strip('"\'`.,:;!?')
+        return normalized or cleaned
+
+    return cleaned
+
+
+def _hf_detect_object(image_data: str, object_prompt: str) -> tuple[RefBox, str | None, float | None]:
     if not HF_API_TOKEN:
         raise HTTPException(
             status_code=500,
@@ -142,53 +183,33 @@ def _hf_detect_object(image_data: str) -> tuple[RefBox, str | None, float | None
         )
 
     image_bytes = _decode_image_bytes(image_data)
-    url = f"https://api-inference.huggingface.co/models/{HF_OBJECT_MODEL}"
-    request = urllib.request.Request(
-        url,
-        data=image_bytes,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {HF_API_TOKEN}",
-            "Content-Type": "application/octet-stream",
-        },
-    )
+
+    prompt = _normalize_object_prompt(object_prompt)
 
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        message = exc.read().decode("utf-8", errors="ignore")
-        raise HTTPException(status_code=502, detail=f"Hugging Face detection failed: {message or exc.reason}") from exc
-    except urllib.error.URLError as exc:
-        raise HTTPException(status_code=502, detail=f"Hugging Face detection unreachable: {exc.reason}") from exc
+        detections = _get_hf_client().zero_shot_object_detection(
+            image_bytes,
+            candidate_labels=[prompt],
+            model=HF_OBJECT_MODEL,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Hugging Face detection failed: {exc}") from exc
 
-    if isinstance(payload, dict) and payload.get("error"):
-        raise HTTPException(status_code=502, detail=f"Hugging Face error: {payload['error']}")
-
-    detections = payload if isinstance(payload, list) else []
     if not detections:
         raise HTTPException(status_code=404, detail="No object detected in the image")
 
-    def _score(det: dict[str, Any]) -> float:
-        return float(det.get("score") or 0.0)
-
-    filtered = [
-        det
-        for det in detections
-        if "phone" not in str(det.get("label", "")).lower()
-    ]
-    ranked = sorted(filtered or detections, key=_score, reverse=True)
+    ranked = sorted(detections, key=lambda det: float(getattr(det, "score", 0.0) or 0.0), reverse=True)
     best = ranked[0]
-    box = best.get("box") or {}
-    xmin = float(box.get("xmin", 0.0))
-    ymin = float(box.get("ymin", 0.0))
-    xmax = float(box.get("xmax", 0.0))
-    ymax = float(box.get("ymax", 0.0))
+    box = getattr(best, "box", None)
+    xmin = float(getattr(box, "xmin", 0.0) or 0.0)
+    ymin = float(getattr(box, "ymin", 0.0) or 0.0)
+    xmax = float(getattr(box, "xmax", 0.0) or 0.0)
+    ymax = float(getattr(box, "ymax", 0.0) or 0.0)
 
     return (
         RefBox(x=xmin, y=ymin, w=max(xmax - xmin, 1.0), h=max(ymax - ymin, 1.0)),
-        str(best.get("label")) if best.get("label") is not None else None,
-        _score(best),
+        str(getattr(best, "label", None)) if getattr(best, "label", None) is not None else None,
+        float(getattr(best, "score", 0.0) or 0.0),
     )
 
 
@@ -224,9 +245,12 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
         )
 
     if payload.phone_box and not payload.object_box:
+        if not payload.object_prompt or not payload.object_prompt.strip():
+            raise HTTPException(status_code=400, detail="object_prompt is required when using phone-based measurement")
+
         phone_dimensions = _get_phone_dimensions(payload.phone_model)
         cm_per_pixel_x, cm_per_pixel_y = _phone_scales(payload.phone_box, phone_dimensions)
-        detected_box, detected_label, detected_score = _hf_detect_object(payload.image_data)
+        detected_box, detected_label, detected_score = _hf_detect_object(payload.image_data, payload.object_prompt)
         width_cm = round(detected_box.w * cm_per_pixel_x, 2)
         height_cm = round(detected_box.h * cm_per_pixel_y, 2)
         aspect_ratio = round(width_cm / max(height_cm, 1e-6), 2)
@@ -271,7 +295,7 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
     raise HTTPException(
         status_code=400,
         detail=(
-            "Provide phone_box and object_box for phone-based measurement, "
+            "Provide phone_box and object_prompt for phone-based measurement, "
             "or ref_box and ref_size_cm for the fallback reference workflow."
         ),
     )
