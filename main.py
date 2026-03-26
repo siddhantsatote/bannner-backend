@@ -1,17 +1,10 @@
 
-import base64
-import binascii
 import json
-import os
-import re
-import urllib.error
-import urllib.request
-from typing import Any
-
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from huggingface_hub import InferenceClient
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+from detector import detect_banner
+
 
 
 class RefBox(BaseModel):
@@ -26,14 +19,8 @@ class PhoneDimensions(BaseModel):
     height_cm: float
 
 
-class AnalyzeRequest(BaseModel):
-    image_data: str = Field(..., description="Base64 data URL for the captured image")
-    phone_box: RefBox | None = None
-    object_box: RefBox | None = None
-    phone_model: str = "oneplus_nord_ce_5"
-    ref_box: RefBox | None = Field(default=None, description="Manual phone reference box when YOLO is skipped")
-    ref_size_cm: float | None = Field(default=None, gt=0)
-    object_prompt: str | None = Field(default=None, description="Text prompt describing the object to detect")
+
+
 
 
 class AnalyzeResponse(BaseModel):
@@ -46,22 +33,10 @@ class AnalyzeResponse(BaseModel):
     detected_score: float | None = None
 
 
-PHONE_DIMENSIONS: dict[str, PhoneDimensions] = {
-    # Replace this with the exact device dimensions you want to support.
-    # Keeping it configurable avoids hard-coding a potentially wrong model size.
-    "oneplus_nord_ce_5": PhoneDimensions(width_cm=7.602, height_cm=16.358),
-}
-
-# Use the optimized Hugging Face zero-shot detection model by default.
-HF_OBJECT_MODEL = os.getenv("HF_OBJECT_MODEL", "omdet/omdet-turbo")
-HF_API_TOKEN = os.getenv("HF_API_TOKEN", "")
-HF_LLM_MODEL = os.getenv("HF_LLM_MODEL", "").strip()
-HF_API_BASE_URL = os.getenv("HF_API_BASE_URL", "https://router.huggingface.co").rstrip("/")
-
-_hf_client: InferenceClient | None = None
 
 
-app = FastAPI(title="Banner Buddy API", version="1.0.0")
+
+app = FastAPI(title="Banner Buddy API", version="2.0.0")
 
 allowed_origins = os.getenv("CORS_ORIGINS", "*")
 cors_origins = [origin.strip() for origin in allowed_origins.split(",") if origin.strip()]
@@ -333,89 +308,49 @@ def _hf_detect_object(image_data: str, object_prompt: str) -> tuple[RefBox, str 
     )
 
 
+
+# New analyze endpoint for local model inference
 @app.post("/api/analyze", response_model=AnalyzeResponse)
-def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
-    _validate_image_data(payload.image_data)
+async def analyze(
+    image: UploadFile = File(...),
+    ref_box: str = Form(...),
+    ref_size_cm: float = Form(...)
+):
+    try:
+        image_bytes = await image.read()
+        ref_box_dict = json.loads(ref_box)
 
-    # Manual phone reference mode: if the frontend only sends ref_box + ref_size_cm,
-    # treat that box as the phone box and use the known phone width for scaling.
-    if payload.ref_box and payload.ref_size_cm and not payload.phone_box:
-        payload.phone_box = payload.ref_box
+        # Step 1 — OmDet-Turbo detects banner
+        detection = detect_banner(image_bytes, ref_box_dict)
 
-    if payload.phone_box and payload.object_box:
-        phone_dimensions = _get_phone_dimensions(payload.phone_model)
-        cm_per_pixel_x, cm_per_pixel_y = _phone_scales(payload.phone_box, phone_dimensions)
-        width_cm = round(payload.object_box.w * cm_per_pixel_x, 2)
-        height_cm = round(payload.object_box.h * cm_per_pixel_y, 2)
-        aspect_ratio = round(width_cm / max(height_cm, 1e-6), 2)
+        # Step 2 — (Optional) Add segmentation, PCA, and real-world size logic here
+        # For now, just return the detected bounding box and label
+        bbox = detection["bbox"]
+        centroid = detection["centroid"]
+        label = detection["label"]
+        score = detection["score"]
 
-        contour: list[list[float]] = [
-            [payload.object_box.x, payload.object_box.y],
-            [payload.object_box.x + payload.object_box.w, payload.object_box.y],
-            [payload.object_box.x + payload.object_box.w, payload.object_box.y + payload.object_box.h],
-            [payload.object_box.x, payload.object_box.y + payload.object_box.h],
+        # Dummy values for mask_contour and cm_per_pixel (replace with real logic as needed)
+        mask_contour = [
+            [bbox["x"], bbox["y"]],
+            [bbox["x"] + bbox["w"], bbox["y"]],
+            [bbox["x"] + bbox["w"], bbox["y"] + bbox["h"]],
+            [bbox["x"], bbox["y"] + bbox["h"]],
         ]
+        width_cm = ref_size_cm  # Placeholder: replace with real calculation
+        height_cm = ref_size_cm  # Placeholder: replace with real calculation
+        aspect_ratio = round(width_cm / max(height_cm, 1e-6), 2)
 
         return AnalyzeResponse(
             width_cm=width_cm,
             height_cm=height_cm,
             aspect_ratio=aspect_ratio,
-            mask_contour=contour,
-            cm_per_pixel=round((cm_per_pixel_x + cm_per_pixel_y) / 2.0, 6),
-        )
-
-    if payload.phone_box and not payload.object_box:
-        if not payload.object_prompt or not payload.object_prompt.strip():
-            raise HTTPException(status_code=400, detail="object_prompt is required when using phone-based measurement")
-
-        phone_dimensions = _get_phone_dimensions(payload.phone_model)
-        cm_per_pixel_x, cm_per_pixel_y = _phone_scales(payload.phone_box, phone_dimensions)
-        detected_box, detected_label, detected_score = _hf_detect_object(payload.image_data, payload.object_prompt)
-        width_cm = round(detected_box.w * cm_per_pixel_x, 2)
-        height_cm = round(detected_box.h * cm_per_pixel_y, 2)
-        aspect_ratio = round(width_cm / max(height_cm, 1e-6), 2)
-
-        contour: list[list[float]] = [
-            [detected_box.x, detected_box.y],
-            [detected_box.x + detected_box.w, detected_box.y],
-            [detected_box.x + detected_box.w, detected_box.y + detected_box.h],
-            [detected_box.x, detected_box.y + detected_box.h],
-        ]
-
-        return AnalyzeResponse(
-            width_cm=width_cm,
-            height_cm=height_cm,
-            aspect_ratio=aspect_ratio,
-            mask_contour=contour,
-            cm_per_pixel=round((cm_per_pixel_x + cm_per_pixel_y) / 2.0, 6),
-            detected_label=detected_label,
-            detected_score=detected_score,
-        )
-
-    if payload.ref_box and payload.ref_size_cm:
-        width_cm = round(payload.ref_size_cm * max(payload.ref_box.w / max(payload.ref_box.h, 1.0), 1.0), 2)
-        height_cm = round(payload.ref_size_cm, 2)
-        aspect_ratio = round(width_cm / max(height_cm, 1e-6), 2)
-
-        contour: list[list[float]] = [
-            [payload.ref_box.x, payload.ref_box.y],
-            [payload.ref_box.x + payload.ref_box.w, payload.ref_box.y],
-            [payload.ref_box.x + payload.ref_box.w, payload.ref_box.y + payload.ref_box.h],
-            [payload.ref_box.x, payload.ref_box.y + payload.ref_box.h],
-        ]
-
-        return AnalyzeResponse(
-            width_cm=width_cm,
-            height_cm=height_cm,
-            aspect_ratio=aspect_ratio,
-            mask_contour=contour,
+            mask_contour=mask_contour,
             cm_per_pixel=None,
+            detected_label=label,
+            detected_score=score,
         )
-
-    raise HTTPException(
-        status_code=400,
-        detail=(
-            "Provide phone_box and object_prompt for phone-based measurement, "
-            "or ref_box and ref_size_cm for the fallback reference workflow."
-        ),
-    )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
