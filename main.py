@@ -229,34 +229,78 @@ def _hf_detect_object(image_data: str, object_prompt: str) -> tuple[RefBox, str 
         },
     )
 
+
+    import traceback
     try:
         with urllib.request.urlopen(request, timeout=90) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="ignore")
         normalized = body.strip() or exc.reason
+        print(f"[HF ERROR] HTTPError: {exc.code} {normalized}")
         if exc.code in (404, 422):
             raise HTTPException(
                 status_code=502,
-                detail=(
-                    f"Hugging Face detection failed: {normalized}. "
-                    "Check HF_OBJECT_MODEL + HF_API_BASE_URL (defaults to router.huggingface.co)."
-                ),
+                detail={
+                    "error": f"Hugging Face detection failed: {normalized}",
+                    "model": HF_OBJECT_MODEL,
+                    "prompt": object_prompt,
+                    "hf_url": url,
+                    "hf_body": request_body.decode("utf-8"),
+                },
             ) from exc
         raise HTTPException(
             status_code=502,
-            detail=f"Hugging Face detection failed: {normalized}",
+            detail={
+                "error": f"Hugging Face detection failed: {normalized}",
+                "model": HF_OBJECT_MODEL,
+                "prompt": object_prompt,
+                "hf_url": url,
+                "hf_body": request_body.decode("utf-8"),
+            },
         ) from exc
     except urllib.error.URLError as exc:
-        raise HTTPException(status_code=502, detail=f"Hugging Face detection unreachable: {exc.reason}") from exc
+        print(f"[HF ERROR] URLError: {exc.reason}")
+        raise HTTPException(status_code=502, detail={
+            "error": f"Hugging Face detection unreachable: {exc.reason}",
+            "model": HF_OBJECT_MODEL,
+            "prompt": object_prompt,
+            "hf_url": url,
+            "hf_body": request_body.decode("utf-8"),
+        }) from exc
+    except Exception as exc:
+        tb = traceback.format_exc()
+        print(f"[HF ERROR] Exception: {tb}")
+        raise HTTPException(status_code=502, detail={
+            "error": f"Unexpected backend error: {str(exc)}",
+            "traceback": tb,
+            "model": HF_OBJECT_MODEL,
+            "prompt": object_prompt,
+            "hf_url": url,
+            "hf_body": request_body.decode("utf-8"),
+        }) from exc
 
     if isinstance(payload, dict) and payload.get("error"):
-        raise HTTPException(status_code=502, detail=f"Hugging Face error: {payload['error']}")
+        print(f"[HF ERROR] API error: {payload['error']}")
+        raise HTTPException(status_code=502, detail={
+            "error": f"Hugging Face error: {payload['error']}",
+            "model": HF_OBJECT_MODEL,
+            "prompt": object_prompt,
+            "hf_url": url,
+            "hf_body": request_body.decode("utf-8"),
+        })
 
     detections = payload if isinstance(payload, list) else []
 
     if not detections:
-        raise HTTPException(status_code=404, detail="No object detected in the image")
+        print("[HF ERROR] No object detected in the image")
+        raise HTTPException(status_code=404, detail={
+            "error": "No object detected in the image",
+            "model": HF_OBJECT_MODEL,
+            "prompt": object_prompt,
+            "hf_url": url,
+            "hf_body": request_body.decode("utf-8"),
+        })
 
     def score_of(item: Any) -> float:
         if isinstance(item, dict):
