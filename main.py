@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 import base64
 import binascii
@@ -53,7 +52,8 @@ PHONE_DIMENSIONS: dict[str, PhoneDimensions] = {
     "oneplus_nord_ce_5": PhoneDimensions(width_cm=7.602, height_cm=16.358),
 }
 
-HF_OBJECT_MODEL = os.getenv("HF_OBJECT_MODEL", "google/owlv2-base-patch16-ensemble")
+# Use the optimized Hugging Face zero-shot detection model by default.
+HF_OBJECT_MODEL = os.getenv("HF_OBJECT_MODEL", "omdet/omdet-turbo")
 HF_API_TOKEN = os.getenv("HF_API_TOKEN", "")
 HF_LLM_MODEL = os.getenv("HF_LLM_MODEL", "").strip()
 HF_API_BASE_URL = os.getenv("HF_API_BASE_URL", "https://router.huggingface.co").rstrip("/")
@@ -186,6 +186,12 @@ def _hf_detect_object(image_data: str, object_prompt: str) -> tuple[RefBox, str 
         )
 
     prompt = _normalize_object_prompt(object_prompt)
+
+    # Support comma-separated multi-label prompt for broader zero-shot detection.
+    candidate_labels = [p.strip() for p in re.split(r"[,\n]", prompt) if p.strip()]
+    if not candidate_labels:
+        raise HTTPException(status_code=400, detail="object_prompt must contain at least one valid label")
+
     image_bytes = _decode_image_bytes(image_data)
     encoded_image = base64.b64encode(image_bytes).decode("utf-8")
 
@@ -204,7 +210,7 @@ def _hf_detect_object(image_data: str, object_prompt: str) -> tuple[RefBox, str 
             "model": HF_OBJECT_MODEL,
             "inputs": image_input,
             "parameters": {
-                "candidate_labels": [prompt],
+                "candidate_labels": candidate_labels,
                 "threshold": 0.1,
             },
             "options": {
